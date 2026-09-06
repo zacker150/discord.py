@@ -887,6 +887,9 @@ class DiscordVoiceWebSocket:
         self.secret_key: Optional[List[int]] = None
         # defaulting to -1
         self.seq_ack: int = -1
+        # Duration of process_commit/process_welcome for the current binary frame,
+        # in milliseconds; available to the post-processing binary hook.
+        self.dave_mls_processing_ms: Optional[float] = None
         if hook:
             self._hook = hook  # type: ignore
         if binary_hook:
@@ -1121,6 +1124,7 @@ class DiscordVoiceWebSocket:
 
     async def received_binary_message(self, msg: bytes) -> None:
         """Process a binary voice frame without letting handler failures stop polling."""
+        self.dave_mls_processing_ms = None
         if len(msg) < 3:
             _log.warning('Ignoring truncated voice binary frame: %d bytes', len(msg))
             return
@@ -1186,7 +1190,11 @@ class DiscordVoiceWebSocket:
                     raise ValueError('Missing MLS commit transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
                 with state.dave_lock:
-                    state.dave_session.process_commit(msg[5:])
+                    started = time.perf_counter()
+                    try:
+                        state.dave_session.process_commit(msg[5:])
+                    finally:
+                        self.dave_mls_processing_ms = (time.perf_counter() - started) * 1000
             except Exception:
                 _log.exception('Failed to process MLS commit for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)
@@ -1205,7 +1213,11 @@ class DiscordVoiceWebSocket:
                     raise ValueError('Missing MLS welcome transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
                 with state.dave_lock:
-                    state.dave_session.process_welcome(msg[5:])
+                    started = time.perf_counter()
+                    try:
+                        state.dave_session.process_welcome(msg[5:])
+                    finally:
+                        self.dave_mls_processing_ms = (time.perf_counter() - started) * 1000
             except Exception:
                 _log.exception('Failed to process MLS welcome for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)

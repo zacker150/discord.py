@@ -672,3 +672,26 @@ def test_real_davey_accepts_expected_user_ids(expected_user_ids):
     session = davey.DaveSession(1, 42, 999)
     with pytest.raises(ValueError):
         session.process_proposals(davey.ProposalsOperationType.append, b'invalid', expected_user_ids=expected_user_ids)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('op, method', [(29, 'process_commit'), (30, 'process_welcome')])
+@pytest.mark.parametrize('fails', [False, True])
+async def test_binary_hook_observes_mls_duration_and_next_frame_clears_it(binary_harness, monkeypatch, op, method, fails):
+    import discord.gateway as gateway
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    if fails:
+        getattr(session, method).side_effect = ValueError('invalid MLS')
+    ticks = iter([100.0, 100.025])
+    monkeypatch.setattr(gateway.time, 'perf_counter', lambda: next(ticks))
+    durations = []
+    async def hook(*args):
+        durations.append(ws.dave_mls_processing_ms)
+    ws._binary_hook = hook
+    await ws.received_binary_message(binary_frame(1, op, struct.pack('>H', 7) + b'body'))
+    await ws.received_binary_message(binary_frame(2, 99, b'other'))
+    assert durations[0] == pytest.approx(25.0)
+    assert durations[1] is None
+    await ws.received_binary_message(b'')
+    assert ws.dave_mls_processing_ms is None
