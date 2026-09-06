@@ -13,8 +13,7 @@ in creating applications that utilise the Discord API.
 Prerequisites
 ---------------
 
-discord.py works with Python 3.8 or higher. Support for earlier versions of Python
-is not provided. Python 2.7 or lower is not supported. Python 3.7 or lower is not supported.
+This fork works with Python 3.10 or higher. Earlier versions are not supported.
 
 
 .. _installing:
@@ -120,4 +119,3 @@ A quick example to showcase how events work:
 
     client = MyClient(intents=intents)
     client.run('my token goes here')
-

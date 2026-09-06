@@ -79,6 +79,7 @@ class VoiceIdentify(TypedDict):
     user_id: Snowflake
     session_id: str
     token: str
+    max_dave_protocol_version: int
 
 
 class VoiceReady(TypedDict):
@@ -87,3 +88,32 @@ class VoiceReady(TypedDict):
     port: int
     modes: List[SupportedModes]
     heartbeat_interval: int
+
+
+class VoiceSessionDescription(TypedDict):
+    mode: SupportedModes
+    secret_key: List[int]
+    dave_protocol_version: int
+
+
+class DavePrepareTransition(TypedDict):
+    transition_id: int
+    protocol_version: int
+
+
+class DaveExecuteTransition(TypedDict):
+    transition_id: int
+
+
+class DavePrepareEpoch(TypedDict):
+    epoch: int
+    protocol_version: int
+
+
+class VoiceClientConnect(TypedDict):
+    # Incoming CLIENTS_CONNECT (11), not outgoing CLIENT_CONNECT (12).
+    user_ids: List[Snowflake]
+
+
+class VoiceClientDisconnect(TypedDict):
+    user_id: Snowflake

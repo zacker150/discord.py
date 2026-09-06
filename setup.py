@@ -1,4 +1,6 @@
 from setuptools import setup
+from email.parser import Parser
+from pathlib import Path
 import re
 
 
@@ -11,6 +13,14 @@ def derive_version() -> str:
         raise RuntimeError('version is not set')
 
     if version.endswith(('a', 'b', 'rc')):
+        # Source archives have no Git history; preserve the version recorded
+        # when the sdist was built instead of falling back to an alpha of zero.
+        metadata_path = Path('PKG-INFO')
+        if metadata_path.is_file():
+            metadata = Parser().parsestr(metadata_path.read_text(encoding='utf-8'))
+            if metadata['Version']:
+                return metadata['Version']
+
         # append version identifier based on commit count
         try:
             import subprocess

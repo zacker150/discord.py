@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import sys
 import threading
 from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union
 
@@ -73,6 +74,9 @@ __all__ = (
 
 
 _log = logging.getLogger(__name__)
+
+if not getattr(sys, '_is_gil_enabled', lambda: True)():
+    _log.warning('DAVE voice is unvalidated on free-threaded Python; use a GIL-enabled build')
 
 
 class VoiceProtocol:
@@ -234,6 +238,8 @@ class VoiceClient(VoiceProtocol):
         self._player: Optional[AudioPlayer] = None
         self.encoder: Encoder = MISSING
         self._incr_nonce: int = 0
+        self._dave_frames_dropped: int = 0
+        self._dave_waiting_for_ready: bool = False
 
         self._connection: VoiceConnectionState = self.create_connection_state()
 
@@ -299,6 +305,61 @@ class VoiceClient(VoiceProtocol):
         """
         with self.dave_lock:
             return self._connection.dave_session.voice_privacy_code if self._connection.dave_session else None
+
+    @property
+    def dave_protocol_version(self) -> int:
+        """:class:`int`: The negotiated DAVE version, or ``0`` for plaintext.
+
+        .. versionadded:: 2.8
+        """
+        with self.dave_lock:
+            return self._connection.dave_protocol_version
+
+    @property
+    def dave_ready(self) -> bool:
+        """:class:`bool`: Whether the negotiated DAVE session can encrypt audio.
+
+        This is false for version 0, before the group is ready, and after cleanup.
+
+        .. versionadded:: 2.8
+        """
+        return self._connection.can_encrypt
+
+    @property
+    def dave_epoch(self) -> Optional[int]:
+        """Optional[:class:`int`]: The current MLS epoch, or ``None`` without a group.
+
+        .. versionadded:: 2.8
+        """
+        with self.dave_lock:
+            session = self._connection.dave_session
+            return session.epoch if session is not None else None
+
+    def get_dave_verification_code(self, user_id: int) -> Optional[str]:
+        """Get a participant's verification code, or ``None`` when DAVE is not ready.
+
+        .. versionadded:: 2.8
+
+        Parameters
+        ----------
+        user_id: :class:`int`
+            The participant's Discord user ID.
+
+        Raises
+        -------
+        ValueError
+            The participant is not in the current group or the native lookup fails.
+
+        Returns
+        -------
+        Optional[:class:`str`]
+            The verification code for the current group.
+        """
+        with self.dave_lock:
+            session = self._connection.dave_session
+            if not self._connection.can_encrypt or session is None:
+                return None
+            return session.get_verification_code(user_id)
 
     @property
     def dave_lock(self) -> threading.RLock:
@@ -427,13 +488,16 @@ class VoiceClient(VoiceProtocol):
 
     # audio related
 
-    def _get_voice_packet(self, data: bytes):
+    def _get_voice_packet(self, data: bytes) -> Optional[bytes]:
         with self.dave_lock:
-            packet = (
-                self._connection.dave_session.encrypt_opus(data)
-                if self._connection.dave_session and self._connection.can_encrypt
-                else data
-            )
+            state = self._connection
+            if state.dave_protocol_version > 0:
+                session = state.dave_session
+                if session is None or not state.can_encrypt:
+                    return None
+                packet = session.encrypt_opus(data)
+            else:
+                packet = data
         header = bytearray(12)
 
         # Formulate rtp header
@@ -627,6 +691,9 @@ class VoiceClient(VoiceProtocol):
 
         You must be connected to play audio.
 
+        When DAVE is negotiated but its group is not ready, the frame is dropped
+        instead of being sent unencrypted. Dropped frames are not buffered.
+
         Parameters
         ----------
         data: :class:`bytes`
@@ -648,6 +715,14 @@ class VoiceClient(VoiceProtocol):
         else:
             encoded_data = data
         packet = self._get_voice_packet(encoded_data)
+        if packet is None:
+            self._dave_frames_dropped += 1
+            if not self._dave_waiting_for_ready:
+                _log.warning('Dropping voice frames while waiting for the DAVE group to become ready')
+                self._dave_waiting_for_ready = True
+            self.checked_add('timestamp', opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+            return
+        self._dave_waiting_for_ready = False
         try:
             self._connection.send_packet(packet)
         except OSError:
