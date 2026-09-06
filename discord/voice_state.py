@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     )
 
     WebsocketHook = Optional[Callable[[DiscordVoiceWebSocket, Dict[str, Any]], Coroutine[Any, Any, Any]]]
+    BinaryWebsocketHook = Optional[Callable[[DiscordVoiceWebSocket, int, int, bytes], Coroutine[Any, Any, Any]]]
     SocketReaderCallback = Callable[[bytes], Any]
 
 has_dave: bool
@@ -195,9 +196,16 @@ class ConnectionFlowState(Enum):
 class VoiceConnectionState:
     """Represents the internal state of a voice connection."""
 
-    def __init__(self, voice_client: VoiceClient, *, hook: Optional[WebsocketHook] = None) -> None:
+    def __init__(
+        self,
+        voice_client: VoiceClient,
+        *,
+        hook: Optional[WebsocketHook] = None,
+        binary_hook: Optional[BinaryWebsocketHook] = None,
+    ) -> None:
         self.voice_client = voice_client
         self.hook = hook
+        self.binary_hook = binary_hook
 
         self.timeout: float = 30.0
         self.reconnect: bool = True
@@ -647,7 +655,9 @@ class VoiceConnectionState:
         seq_ack = -1
         if self.ws is not MISSING:
             seq_ack = self.ws.seq_ack
-        ws = await DiscordVoiceWebSocket.from_connection_state(self, resume=resume, hook=self.hook, seq_ack=seq_ack)
+        ws = await DiscordVoiceWebSocket.from_connection_state(
+            self, resume=resume, hook=self.hook, binary_hook=self.binary_hook, seq_ack=seq_ack
+        )
         self.state = ConnectionFlowState.websocket_connected
         return ws
 

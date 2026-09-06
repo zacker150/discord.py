@@ -822,10 +822,18 @@ class DiscordVoiceWebSocket:
         Receive only. Tells you that your websocket connection was acknowledged.
     RESUMED
         Sent only. Tells you that your RESUME request has succeeded.
+    CLIENTS_CONNECT
+        Receive only. Indicates the users that are connected to voice.
     CLIENT_CONNECT
         Indicates a user has connected to voice.
     CLIENT_DISCONNECT
         Receive only.  Indicates a user has disconnected from voice.
+    MEDIA_SINK_WANTS
+        Receive only. Indicates the quality the server wants each stream to be sent at.
+    FLAGS
+        Receive only. Indicates the voice flags of a user.
+    PLATFORM
+        Receive only. Indicates the platform a user is connected from.
     """
 
     if TYPE_CHECKING:
@@ -848,6 +856,9 @@ class DiscordVoiceWebSocket:
     CLIENTS_CONNECT                = 11
     CLIENT_CONNECT                 = 12
     CLIENT_DISCONNECT              = 13
+    MEDIA_SINK_WANTS               = 15
+    FLAGS                          = 18
+    PLATFORM                       = 20
     DAVE_PREPARE_TRANSITION        = 21
     DAVE_EXECUTE_TRANSITION        = 22
     DAVE_TRANSITION_READY          = 23
@@ -867,6 +878,7 @@ class DiscordVoiceWebSocket:
         loop: asyncio.AbstractEventLoop,
         *,
         hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+        binary_hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
     ) -> None:
         self.ws: aiohttp.ClientWebSocketResponse = socket
         self.loop: asyncio.AbstractEventLoop = loop
@@ -877,8 +889,13 @@ class DiscordVoiceWebSocket:
         self.seq_ack: int = -1
         if hook:
             self._hook = hook  # type: ignore
+        if binary_hook:
+            self._binary_hook = binary_hook  # type: ignore
 
     async def _hook(self, *args: Any) -> None:
+        pass
+
+    async def _binary_hook(self, *args: Any) -> None:
         pass
 
     async def send_as_json(self, data: Any) -> None:
@@ -925,6 +942,7 @@ class DiscordVoiceWebSocket:
         *,
         resume: bool = False,
         hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
+        binary_hook: Optional[Callable[..., Coroutine[Any, Any, Any]]] = None,
         seq_ack: int = -1,
     ) -> Self:
         """Creates a voice websocket for the :class:`VoiceClient`."""
@@ -932,7 +950,7 @@ class DiscordVoiceWebSocket:
         client = state.voice_client
         http = client._state.http
         socket = await http.ws_connect(gateway, compress=15)
-        ws = cls(socket, loop=client.loop, hook=hook)
+        ws = cls(socket, loop=client.loop, hook=hook, binary_hook=binary_hook)
         ws.gateway = gateway
         ws.seq_ack = seq_ack
         ws._connection = state
@@ -1047,11 +1065,18 @@ class DiscordVoiceWebSocket:
     async def received_binary_message(self, msg: bytes) -> None:
         self.seq_ack = struct.unpack_from('>H', msg, 0)[0]
         op = msg[2]
+        payload = msg[3:]
         _log.debug('Voice websocket binary frame received: %d bytes; seq=%s op=%s', len(msg), self.seq_ack, op)
         state = self._connection
 
-        if state.dave_session is None:
-            return
+        if state.dave_session is not None:
+            await self._handle_dave_binary(op, msg)
+
+        await self._binary_hook(self, op, self.seq_ack, payload)
+
+    async def _handle_dave_binary(self, op: int, msg: bytes) -> None:
+        state = self._connection
+        assert state.dave_session is not None
 
         if op == self.MLS_EXTERNAL_SENDER:
             state.dave_session.set_external_sender(msg[3:])
