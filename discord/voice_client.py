@@ -301,6 +301,13 @@ class VoiceClient(VoiceProtocol):
     # DAVE lifecycle callbacks. These are no-ops that exist to be overridden, and
     # are called synchronously on the event loop thread as the handshake proceeds.
 
+    def _dave_state_changed(self, reason: str) -> None:
+        """Called synchronously after a binary voice frame and its hook are processed.
+
+        ``reason`` is ``binary_op_<opcode>``. Overrides should inspect the current
+        session, since processing may have failed or triggered recovery.
+        """
+
     def on_dave_transition_prepared(self, transition_id: int, protocol_version: int) -> None:
         """Called when the voice server asks us to prepare for a DAVE transition.
 

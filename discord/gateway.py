@@ -1119,18 +1119,35 @@ class DiscordVoiceWebSocket:
                 _log.exception('Failed to recover from DAVE voice op %d', op)
 
     async def received_binary_message(self, msg: bytes) -> None:
-        self.seq_ack = struct.unpack_from('>H', msg, 0)[0]
+        """Process a binary voice frame without letting handler failures stop polling."""
+        if len(msg) < 3:
+            _log.warning('Ignoring truncated voice binary frame: %d bytes', len(msg))
+            return
+
+        seq = self.seq_ack = struct.unpack_from('>H', msg, 0)[0]
         op = msg[2]
         payload = msg[3:]
         _log.debug('Voice websocket binary frame received: %d bytes; seq=%s op=%s', len(msg), self.seq_ack, op)
         state = self._connection
 
-        if state.dave_session is not None:
-            await self._handle_dave_binary(op, msg)
+        try:
+            if state.dave_session is not None:
+                await self._handle_dave_binary(op, msg)
+        except Exception:  # noqa: BLE001 - contain handler failures at the polling boundary
+            _log.exception('Failed to handle DAVE binary op %d', op)
 
-        await self._binary_hook(self, op, self.seq_ack, payload)
+        try:
+            await self._binary_hook(self, op, seq, payload)
+        except Exception:  # noqa: BLE001 - extension hooks must not stop voice polling
+            _log.exception('Failed to run binary voice hook for op %d', op)
+
+        try:
+            state.voice_client._dave_state_changed(f'binary_op_{op}')
+        except Exception:  # noqa: BLE001 - extension callbacks must not stop voice polling
+            _log.exception('Failed to notify DAVE state change for binary op %d', op)
 
     async def _handle_dave_binary(self, op: int, msg: bytes) -> None:
+        """Apply MLS messages and recover from invalid proposals or transitions."""
         state = self._connection
         assert state.dave_session is not None
 
@@ -1138,10 +1155,21 @@ class DiscordVoiceWebSocket:
             state.dave_session.set_external_sender(msg[3:])
             _log.debug('Set MLS external sender')
         elif op == self.MLS_PROPOSALS:
-            optype = msg[3]
-            result = state.dave_session.process_proposals(
-                davey.ProposalsOperationType.append if optype == 0 else davey.ProposalsOperationType.revoke, msg[4:]
-            )
+            try:
+                if len(msg) < 4 or msg[3] not in (0, 1):
+                    raise ValueError('Missing or invalid MLS proposal operation type')
+                expected_user_ids = (
+                    sorted(state.dave_known_user_ids | {state.user.id}) if state.dave_known_user_ids else None
+                )
+                result = state.dave_session.process_proposals(
+                    davey.ProposalsOperationType.append if msg[3] == 0 else davey.ProposalsOperationType.revoke,
+                    msg[4:],
+                    expected_user_ids=expected_user_ids,
+                )
+            except ValueError:
+                _log.warning('Invalid MLS proposals, re-keying', exc_info=True)
+                await state.reinit_dave_session()
+                return
             if isinstance(result, davey.CommitWelcome):
                 await self.send_binary(
                     DiscordVoiceWebSocket.MLS_COMMIT_WELCOME,
@@ -1149,24 +1177,32 @@ class DiscordVoiceWebSocket:
                 )
             _log.debug('MLS proposals processed')
         elif op == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
-            transition_id = struct.unpack_from('>H', msg, 3)[0]
+            transition_id = 0
             try:
+                if len(msg) < 5:
+                    raise ValueError('Missing MLS commit transition ID')
+                transition_id = struct.unpack_from('>H', msg, 3)[0]
                 state.dave_session.process_commit(msg[5:])
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS commit processed for transition id %d', transition_id)
             except Exception:
+                _log.exception('Failed to process MLS commit for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)
         elif op == self.MLS_WELCOME:
-            transition_id = struct.unpack_from('>H', msg, 3)[0]
+            transition_id = 0
             try:
+                if len(msg) < 5:
+                    raise ValueError('Missing MLS welcome transition ID')
+                transition_id = struct.unpack_from('>H', msg, 3)[0]
                 state.dave_session.process_welcome(msg[5:])
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS welcome processed for transition id %d', transition_id)
             except Exception:
+                _log.exception('Failed to process MLS welcome for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)
 
     async def initial_connection(self, data: Dict[str, Any]) -> None:

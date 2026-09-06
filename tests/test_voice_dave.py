@@ -11,6 +11,7 @@ import inspect
 import struct
 import threading
 import types
+from unittest.mock import Mock
 
 import pytest
 
@@ -33,6 +34,7 @@ class StubConnectionState:
         self.dave_session = dave_session
         self.dave_protocol_version = 1
         self.dave_pending_transitions = {}
+        self.voice_client = types.SimpleNamespace(_dave_state_changed=Mock())
 
 
 def make_ws(state, binary_hook=None):
@@ -179,6 +181,9 @@ class RecordingVoiceClient:
         self.user = StubUser()
         self.supported_modes = ('aead_xchacha20_poly1305_rtpsize',)
         self.dave_events = []
+
+    def _dave_state_changed(self, reason):
+        self.dave_events.append(('state', reason))
 
     def on_dave_transition_prepared(self, transition_id, protocol_version):
         self.dave_events.append(('prepared', transition_id, protocol_version))
@@ -436,3 +441,195 @@ async def test_membership_seeded_from_channel_voice_states(harness, next_user_id
         del vc.channel.voice_states
     await ws.initial_connection({'ssrc': 2, 'port': 3, 'ip': '1.2.3.4', 'modes': ['aead_xchacha20_poly1305_rtpsize']})
     assert state.dave_known_user_ids == set(next_user_ids or ()) - {42}
+
+
+# --- A3: binary handlers --------------------------------------------------
+
+
+@pytest.fixture
+def binary_harness(harness, monkeypatch):
+    """Provide controllable MLS operations and the real recovery path."""
+    import discord.gateway as gateway
+
+    state, ws, sent_json, sent_binary, vc = harness
+    session = ScriptedDaveSession(1, 42, 999)
+    session.set_external_sender = Mock()
+    session.process_proposals = Mock(return_value=None)
+    session.process_commit = Mock()
+    session.process_welcome = Mock()
+    state.dave_session = session
+    state.dave_protocol_version = 1
+    monkeypatch.setattr(
+        gateway,
+        'davey',
+        types.SimpleNamespace(
+            ProposalsOperationType=types.SimpleNamespace(append=0, revoke=1),
+            CommitWelcome=types.SimpleNamespace,
+        ),
+        raising=False,
+    )
+    return harness, session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('members, expected', [({11, 10}, [10, 11, 42]), (set(), None)])
+@pytest.mark.parametrize('operation', [0, 1])
+@pytest.mark.parametrize('welcome', [b'welcome', None])
+async def test_proposals_validate_members_and_send_commit(binary_harness, members, expected, operation, welcome):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    state.dave_known_user_ids = members
+    session.process_proposals.return_value = types.SimpleNamespace(commit=b'commit', welcome=welcome)
+
+    await ws.received_binary_message(binary_frame(1, ws.MLS_PROPOSALS, bytes([operation]) + b'proposals'))
+
+    session.process_proposals.assert_called_once_with(operation, b'proposals', expected_user_ids=expected)
+    assert sent_binary == [(ws.MLS_COMMIT_WELCOME, b'commit' + (welcome or b''))]
+    assert sent_json == []
+
+
+@pytest.mark.asyncio
+async def test_proposal_without_commit_sends_nothing(binary_harness):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    await ws.received_binary_message(binary_frame(1, ws.MLS_PROPOSALS, b'\x00proposals'))
+    assert sent_binary == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [b'\x00bad', b'', b'\x02invalid'])
+async def test_invalid_proposals_rekey_before_hooks(binary_harness, payload):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    session.process_proposals.side_effect = ValueError('unknown member')
+    observed = []
+
+    async def hook(*args):
+        observed.append(list(sent_binary))
+
+    ws._binary_hook = hook
+    await ws.received_binary_message(binary_frame(2, ws.MLS_PROPOSALS, payload))
+
+    assert sent_binary == [(ws.MLS_KEY_PACKAGE, b'key-package')]
+    assert observed == [sent_binary]
+    assert sent_json == []
+    assert session.reinit_calls == [(1, 42, 999)]
+    assert vc.dave_events == [('state', 'binary_op_27')]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('op, method', [(29, 'process_commit'), (30, 'process_welcome')])
+@pytest.mark.parametrize('transition_id', [0, 7])
+async def test_binary_transition_acknowledgement(binary_harness, op, method, transition_id):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    await ws.received_binary_message(binary_frame(3, op, struct.pack('>H', transition_id) + b'body'))
+    getattr(session, method).assert_called_once_with(b'body')
+    assert state.dave_pending_transitions == ({7: 1} if transition_id else {})
+    assert sent_json == ([{'op': ws.DAVE_TRANSITION_READY, 'd': {'transition_id': 7}}] if transition_id else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('op, method', [(29, 'process_commit'), (30, 'process_welcome')])
+@pytest.mark.parametrize('payload, transition_id', [(b'', 0), (b'\x01', 0), (b'\x00\x07bad', 7)])
+async def test_invalid_binary_transition_recovers(binary_harness, op, method, payload, transition_id):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    getattr(session, method).side_effect = ValueError('invalid MLS data')
+    await ws.received_binary_message(binary_frame(4, op, payload))
+    assert sent_json == [{'op': ws.MLS_INVALID_COMMIT_WELCOME, 'd': {'transition_id': transition_id}}]
+    assert sent_binary == [(ws.MLS_KEY_PACKAGE, b'key-package')]
+    assert state.dave_pending_transitions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['sender', 'proposal', 'recovery', 'send', 'hook', 'callback'])
+async def test_binary_failures_do_not_prevent_next_frame(binary_harness, failure, caplog):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    observed = []
+
+    async def hook(ws, op, seq, payload):
+        observed.append(('hook', seq))
+        if failure == 'hook':
+            raise RuntimeError('hook failed')
+
+    def changed(reason):
+        observed.append(('state', reason))
+        if failure == 'callback':
+            raise RuntimeError('callback failed')
+
+    ws._binary_hook = hook
+    vc._dave_state_changed = changed
+    op, payload = ws.MLS_EXTERNAL_SENDER, b'sender'
+    if failure == 'sender':
+        session.set_external_sender.side_effect = RuntimeError('sender failed')
+    elif failure == 'proposal':
+        op, payload = ws.MLS_PROPOSALS, b'\x00proposals'
+        session.process_proposals.side_effect = RuntimeError('proposal failed')
+    elif failure == 'recovery':
+        op, payload = ws.MLS_WELCOME, b'\x00\x07bad'
+        session.process_welcome.side_effect = ValueError('bad welcome')
+
+        async def recover(transition_id):
+            raise RuntimeError('recovery failed')
+
+        state._recover_from_invalid_commit = recover
+    elif failure == 'send':
+        op, payload = ws.MLS_PROPOSALS, b'\x00proposals'
+        session.process_proposals.return_value = types.SimpleNamespace(commit=b'commit', welcome=None)
+
+        async def send(*args):
+            raise RuntimeError('send failed')
+
+        ws.send_binary = send
+
+    await ws.received_binary_message(binary_frame(5, op, payload))
+    await ws.received_binary_message(binary_frame(6, 99, b'next'))
+
+    assert observed == [('hook', 5), ('state', f'binary_op_{op}'), ('hook', 6), ('state', 'binary_op_99')]
+    assert ws.seq_ack == 6
+    assert 'Failed' in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('payload', [b'', b'\x00', b'\x00\x01'])
+async def test_truncated_binary_header_preserves_sequence(binary_harness, payload):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    ws.seq_ack = 10
+    await ws.received_binary_message(payload)
+    assert ws.seq_ack == 10
+    assert vc.dave_events == []
+
+
+@pytest.mark.asyncio
+async def test_binary_cancellation_propagates(binary_harness):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    session.set_external_sender.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await ws.received_binary_message(binary_frame(1, ws.MLS_EXTERNAL_SENDER, b'sender'))
+
+
+@pytest.mark.asyncio
+async def test_proposal_rekey_failure_still_notifies(binary_harness):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    session.process_proposals.side_effect = ValueError('invalid proposal')
+
+    async def reinit():
+        raise RuntimeError('cannot re-key')
+
+    state.reinit_dave_session = reinit
+    await ws.received_binary_message(binary_frame(1, ws.MLS_PROPOSALS, b'\x00bad'))
+    assert vc.dave_events == [('state', 'binary_op_27')]
+
+
+@pytest.mark.parametrize('expected_user_ids', [None, [10, 42]])
+def test_real_davey_accepts_expected_user_ids(expected_user_ids):
+    """Check the native binding accepts the keyword and rejects invalid MLS bytes."""
+    davey = pytest.importorskip('davey')
+    session = davey.DaveSession(1, 42, 999)
+    with pytest.raises(ValueError):
+        session.process_proposals(davey.ProposalsOperationType.append, b'invalid', expected_user_ids=expected_user_ids)
