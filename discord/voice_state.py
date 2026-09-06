@@ -45,7 +45,7 @@ import asyncio
 import logging
 import threading
 
-from typing import TYPE_CHECKING, Optional, Dict, List, Callable, Coroutine, Any, Tuple
+from typing import TYPE_CHECKING, Optional, Dict, List, Callable, Coroutine, Any, Set, Tuple
 
 from .enums import Enum
 from .utils import MISSING, sane_wait_for
@@ -228,6 +228,7 @@ class VoiceConnectionState:
         self.dave_protocol_version: int = 0
         self.dave_pending_transitions: Dict[int, int] = {}
         self.dave_downgraded: bool = False
+        self.dave_known_user_ids: Set[int] = set()
 
         self._state: ConnectionFlowState = ConnectionFlowState.disconnected
         self._expecting_disconnect: bool = False

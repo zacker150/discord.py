@@ -298,6 +298,31 @@ class VoiceClient(VoiceProtocol):
         """
         return self._connection.dave_session.voice_privacy_code if self._connection.dave_session else None
 
+    # DAVE lifecycle callbacks. These are no-ops that exist to be overridden, and
+    # are called synchronously on the event loop thread as the handshake proceeds.
+
+    def on_dave_transition_prepared(self, transition_id: int, protocol_version: int) -> None:
+        """Called when the voice server asks us to prepare for a DAVE transition.
+
+        .. versionadded:: 2.8
+        """
+
+    def on_dave_transition_executed(self, transition_id: int, protocol_version: int) -> None:
+        """Called after a DAVE transition has been executed.
+
+        ``protocol_version`` is the version in effect after the transition.
+
+        .. versionadded:: 2.8
+        """
+
+    def on_dave_epoch_prepared(self, epoch: int, protocol_version: int) -> None:
+        """Called when the voice server announces a new DAVE epoch.
+
+        An epoch of ``1`` means a new MLS group is being created.
+
+        .. versionadded:: 2.8
+        """
+
     def checked_add(self, attr: str, value: int, limit: int) -> None:
         val = getattr(self, attr)
         if val + value > limit:

@@ -1034,33 +1034,89 @@ class DiscordVoiceWebSocket:
             interval = data['heartbeat_interval'] / 1000.0
             self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
             self._keep_alive.start()
-        elif self._connection.dave_session:
-            state = self._connection
-            if op == self.DAVE_PREPARE_TRANSITION:
-                _log.debug(
-                    'Preparing for DAVE transition id %d for protocol version %d',
-                    data['transition_id'],
-                    data['protocol_version'],
-                )
-                state.dave_pending_transitions[data['transition_id']] = data['protocol_version']
-                if data['transition_id'] == 0:
-                    await state._execute_transition(data['transition_id'])
-                else:
-                    if data['protocol_version'] == 0 and state.dave_session:
-                        state.dave_session.set_passthrough_mode(True, 120)
-
-                    await self.send_transition_ready(data['transition_id'])
-            elif op == self.DAVE_EXECUTE_TRANSITION:
-                _log.debug('Executing DAVE transition id %d', data['transition_id'])
-                await state._execute_transition(data['transition_id'])
-            elif op == self.DAVE_PREPARE_EPOCH:
-                _log.debug('Preparing for DAVE epoch %d', data['epoch'])
-                # When the epoch ID is equal to 1, this message indicates that a new MLS group is to be created for the given protocol version.
-                if data['epoch'] == 1:
-                    state.dave_protocol_version = data['protocol_version']
-                    await state.reinit_dave_session()
+        elif op in (self.DAVE_PREPARE_TRANSITION, self.DAVE_EXECUTE_TRANSITION, self.DAVE_PREPARE_EPOCH):
+            await self._handle_dave_json(op, data)
+        elif op in (self.SPEAKING, self.CLIENTS_CONNECT, self.CLIENT_DISCONNECT):
+            self._track_dave_membership(op, data)
 
         await self._hook(self, msg)
+
+    def _track_dave_membership(self, op: int, data: Dict[str, Any]) -> None:
+        # The set of users the server says are in the call, used to validate MLS
+        # proposals. Our own id is not included; the proposal check adds it.
+        known = self._connection.dave_known_user_ids
+        try:
+            if op == self.CLIENTS_CONNECT:
+                known.update(int(user_id) for user_id in data['user_ids'])
+            elif op == self.CLIENT_DISCONNECT:
+                known.discard(int(data['user_id']))
+            elif op == self.SPEAKING:
+                known.add(int(data['user_id']))
+        except (KeyError, TypeError, ValueError):
+            _log.debug('Could not track DAVE membership from voice op %d: %s', op, data)
+
+    def _call_dave_callback(self, callback: Callable[[int, int], None], identifier: int, protocol_version: int) -> None:
+        # Application callbacks must not interrupt the handshake or trigger re-keying.
+        try:
+            callback(identifier, protocol_version)
+        except Exception:
+            _log.exception('Exception in DAVE lifecycle callback')
+
+    async def _handle_dave_json(self, op: int, data: Dict[str, Any]) -> None:
+        state = self._connection
+        transition_id = data.get('transition_id', 0)
+
+        try:
+            if op == self.DAVE_PREPARE_TRANSITION:
+                protocol_version = data['protocol_version']
+                _log.debug(
+                    'Preparing for DAVE transition id %d for protocol version %d',
+                    transition_id,
+                    protocol_version,
+                )
+                state.dave_pending_transitions[transition_id] = protocol_version
+
+                if protocol_version == 0:
+                    if state.dave_session is not None:
+                        state.dave_session.set_passthrough_mode(True, 120)
+                elif state.dave_session is None:
+                    # The call started at version 0 and is being upgraded, so there is
+                    # no group to transition into yet. Create one and send a key package
+                    # now, otherwise we never join and hear ciphertext forever.
+                    state.dave_protocol_version = protocol_version
+                    await state.reinit_dave_session()
+
+                self._call_dave_callback(state.voice_client.on_dave_transition_prepared, transition_id, protocol_version)
+
+                if transition_id == 0:
+                    await state._execute_transition(transition_id)
+                    self._call_dave_callback(
+                        state.voice_client.on_dave_transition_executed, transition_id, state.dave_protocol_version
+                    )
+                else:
+                    await self.send_transition_ready(transition_id)
+            elif op == self.DAVE_EXECUTE_TRANSITION:
+                _log.debug('Executing DAVE transition id %d', transition_id)
+                await state._execute_transition(transition_id)
+                self._call_dave_callback(
+                    state.voice_client.on_dave_transition_executed, transition_id, state.dave_protocol_version
+                )
+            elif op == self.DAVE_PREPARE_EPOCH:
+                epoch = data['epoch']
+                protocol_version = data['protocol_version']
+                _log.debug('Preparing for DAVE epoch %d', epoch)
+                # When the epoch ID is equal to 1, this message indicates that a new MLS
+                # group is to be created for the given protocol version.
+                if epoch == 1:
+                    state.dave_protocol_version = protocol_version
+                    await state.reinit_dave_session()
+                self._call_dave_callback(state.voice_client.on_dave_epoch_prepared, epoch, protocol_version)
+        except Exception:
+            _log.exception('Failed to handle DAVE voice op %d, re-keying', op)
+            try:
+                await state._recover_from_invalid_commit(transition_id)
+            except Exception:
+                _log.exception('Failed to recover from DAVE voice op %d', op)
 
     async def received_binary_message(self, msg: bytes) -> None:
         self.seq_ack = struct.unpack_from('>H', msg, 0)[0]
@@ -1118,6 +1174,17 @@ class DiscordVoiceWebSocket:
         state.ssrc = data['ssrc']
         state.voice_port = data['port']
         state.endpoint_ip = data['ip']
+
+        # Seed the membership set from the cache so the first MLS proposal can be
+        # validated. Needs the voice_states intent and a warm cache; when the cache
+        # is cold this stays empty and proposal validation is skipped rather than
+        # rejecting every user.
+        channel = state.voice_client.channel
+        voice_states = getattr(channel, 'voice_states', None)
+        state.dave_known_user_ids.clear()
+        if voice_states:
+            state.dave_known_user_ids.update(user_id for user_id in voice_states if user_id != state.user.id)
+            _log.debug('Seeded DAVE membership with %d user(s)', len(state.dave_known_user_ids))
 
         _log.debug('Connecting to voice socket')
         await self.loop.sock_connect(state.socket, (state.endpoint_ip, state.voice_port))
