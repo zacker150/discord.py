@@ -828,6 +828,8 @@ class DiscordVoiceWebSocket:
         Indicates a user has connected to voice.
     CLIENT_DISCONNECT
         Receive only.  Indicates a user has disconnected from voice.
+    MEDIA_SINK_WANTS
+        Receive only. Indicates the quality the server wants each stream to be sent at.
     FLAGS
         Receive only. Indicates the voice flags of a user.
     PLATFORM
@@ -854,6 +856,7 @@ class DiscordVoiceWebSocket:
     CLIENTS_CONNECT                = 11
     CLIENT_CONNECT                 = 12
     CLIENT_DISCONNECT              = 13
+    MEDIA_SINK_WANTS               = 15
     FLAGS                          = 18
     PLATFORM                       = 20
     DAVE_PREPARE_TRANSITION        = 21

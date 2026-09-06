@@ -133,5 +133,6 @@ def test_voice_opcodes():
     assert DiscordVoiceWebSocket.CLIENTS_CONNECT == 11
     assert DiscordVoiceWebSocket.CLIENT_CONNECT == 12
     assert DiscordVoiceWebSocket.CLIENT_DISCONNECT == 13
+    assert DiscordVoiceWebSocket.MEDIA_SINK_WANTS == 15
     assert DiscordVoiceWebSocket.FLAGS == 18
     assert DiscordVoiceWebSocket.PLATFORM == 20
