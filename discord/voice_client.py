@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import threading
 from typing import Any, Callable, List, Optional, TYPE_CHECKING, Tuple, Union
 
 from . import opus
@@ -296,7 +297,19 @@ class VoiceClient(VoiceProtocol):
 
         .. versionadded:: 2.7
         """
-        return self._connection.dave_session.voice_privacy_code if self._connection.dave_session else None
+        with self.dave_lock:
+            return self._connection.dave_session.voice_privacy_code if self._connection.dave_session else None
+
+    @property
+    def dave_lock(self) -> threading.RLock:
+        """The shared lock for accessing the DAVE session from another thread.
+
+        Hold it while reading the session reference and calling native methods.
+        Release it before awaiting, performing I/O, or invoking callbacks.
+
+        .. versionadded:: 2.8
+        """
+        return self._connection.dave_lock
 
     # DAVE lifecycle callbacks. These are no-ops that exist to be overridden, and
     # are called synchronously on the event loop thread as the handshake proceeds.
@@ -415,11 +428,12 @@ class VoiceClient(VoiceProtocol):
     # audio related
 
     def _get_voice_packet(self, data: bytes):
-        packet = (
-            self._connection.dave_session.encrypt_opus(data)
-            if self._connection.dave_session and self._connection.can_encrypt
-            else data
-        )
+        with self.dave_lock:
+            packet = (
+                self._connection.dave_session.encrypt_opus(data)
+                if self._connection.dave_session and self._connection.can_encrypt
+                else data
+            )
         header = bytearray(12)
 
         # Formulate rtp header

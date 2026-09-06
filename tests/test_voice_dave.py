@@ -31,6 +31,7 @@ class StubDaveSession:
 
 class StubConnectionState:
     def __init__(self, dave_session=None):
+        self.dave_lock = threading.RLock()
         self.dave_session = dave_session
         self.dave_protocol_version = 1
         self.dave_pending_transitions = {}
@@ -155,6 +156,7 @@ class ScriptedDaveSession:
         self.channel_id = channel_id
         self.ready = True
         self.epoch = 1
+        self.voice_privacy_code = 'test-privacy-code'
         self.passthrough_calls = []
         self.reinit_calls = []
         self.reset_calls = 0
@@ -222,6 +224,7 @@ def harness(monkeypatch):
 
     state = VoiceConnectionState.__new__(VoiceConnectionState)
     state.voice_client = voice_client  # type: ignore
+    state.dave_lock = threading.RLock()
     state.dave_session = None
     state.dave_protocol_version = 0
     state.dave_pending_transitions = {}
@@ -231,6 +234,7 @@ def harness(monkeypatch):
     ws = DiscordVoiceWebSocket(None, None)  # type: ignore
     ws._connection = state  # type: ignore
     voice_client.ws = ws
+    state.ws = ws
 
     sent_json = []
     sent_binary = []
