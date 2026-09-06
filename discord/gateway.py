@@ -1027,7 +1027,8 @@ class DiscordVoiceWebSocket:
         elif op == self.SESSION_DESCRIPTION:
             self._connection.mode = data['mode']
             await self.load_secret_key(data)
-            self._connection.dave_protocol_version = data['dave_protocol_version']
+            with self._connection.dave_lock:
+                self._connection.dave_protocol_version = data['dave_protocol_version']
             if data['dave_protocol_version'] > 0:
                 await self._connection.reinit_dave_session()
         elif op == self.HELLO:
@@ -1044,16 +1045,17 @@ class DiscordVoiceWebSocket:
     def _track_dave_membership(self, op: int, data: Dict[str, Any]) -> None:
         # The set of users the server says are in the call, used to validate MLS
         # proposals. Our own id is not included; the proposal check adds it.
-        known = self._connection.dave_known_user_ids
-        try:
-            if op == self.CLIENTS_CONNECT:
-                known.update(int(user_id) for user_id in data['user_ids'])
-            elif op == self.CLIENT_DISCONNECT:
-                known.discard(int(data['user_id']))
-            elif op == self.SPEAKING:
-                known.add(int(data['user_id']))
-        except (KeyError, TypeError, ValueError):
-            _log.debug('Could not track DAVE membership from voice op %d: %s', op, data)
+        with self._connection.dave_lock:
+            known = self._connection.dave_known_user_ids
+            try:
+                if op == self.CLIENTS_CONNECT:
+                    known.update(int(user_id) for user_id in data['user_ids'])
+                elif op == self.CLIENT_DISCONNECT:
+                    known.discard(int(data['user_id']))
+                elif op == self.SPEAKING:
+                    known.add(int(data['user_id']))
+            except (KeyError, TypeError, ValueError):
+                _log.debug('Could not track DAVE membership from voice op %d: %s', op, data)
 
     def _call_dave_callback(self, callback: Callable[[int, int], None], identifier: int, protocol_version: int) -> None:
         # Application callbacks must not interrupt the handshake or trigger re-keying.
@@ -1074,16 +1076,14 @@ class DiscordVoiceWebSocket:
                     transition_id,
                     protocol_version,
                 )
-                state.dave_pending_transitions[transition_id] = protocol_version
-
-                if protocol_version == 0:
-                    if state.dave_session is not None:
+                with state.dave_lock:
+                    state.dave_pending_transitions[transition_id] = protocol_version
+                    needs_session = protocol_version > 0 and state.dave_session is None
+                    if protocol_version == 0 and state.dave_session is not None:
                         state.dave_session.set_passthrough_mode(True, 120)
-                elif state.dave_session is None:
-                    # The call started at version 0 and is being upgraded, so there is
-                    # no group to transition into yet. Create one and send a key package
-                    # now, otherwise we never join and hear ciphertext forever.
-                    state.dave_protocol_version = protocol_version
+                    elif needs_session:
+                        state.dave_protocol_version = protocol_version
+                if needs_session:
                     await state.reinit_dave_session()
 
                 self._call_dave_callback(state.voice_client.on_dave_transition_prepared, transition_id, protocol_version)
@@ -1108,7 +1108,8 @@ class DiscordVoiceWebSocket:
                 # When the epoch ID is equal to 1, this message indicates that a new MLS
                 # group is to be created for the given protocol version.
                 if epoch == 1:
-                    state.dave_protocol_version = protocol_version
+                    with state.dave_lock:
+                        state.dave_protocol_version = protocol_version
                     await state.reinit_dave_session()
                 self._call_dave_callback(state.voice_client.on_dave_epoch_prepared, epoch, protocol_version)
         except Exception:
@@ -1152,7 +1153,8 @@ class DiscordVoiceWebSocket:
         assert state.dave_session is not None
 
         if op == self.MLS_EXTERNAL_SENDER:
-            state.dave_session.set_external_sender(msg[3:])
+            with state.dave_lock:
+                state.dave_session.set_external_sender(msg[3:])
             _log.debug('Set MLS external sender')
         elif op == self.MLS_PROPOSALS:
             try:
@@ -1161,11 +1163,12 @@ class DiscordVoiceWebSocket:
                 expected_user_ids = (
                     sorted(state.dave_known_user_ids | {state.user.id}) if state.dave_known_user_ids else None
                 )
-                result = state.dave_session.process_proposals(
-                    davey.ProposalsOperationType.append if msg[3] == 0 else davey.ProposalsOperationType.revoke,
-                    msg[4:],
-                    expected_user_ids=expected_user_ids,
-                )
+                with state.dave_lock:
+                    result = state.dave_session.process_proposals(
+                        davey.ProposalsOperationType.append if msg[3] == 0 else davey.ProposalsOperationType.revoke,
+                        msg[4:],
+                        expected_user_ids=expected_user_ids,
+                    )
             except ValueError:
                 _log.warning('Invalid MLS proposals, re-keying', exc_info=True)
                 await state.reinit_dave_session()
@@ -1182,14 +1185,17 @@ class DiscordVoiceWebSocket:
                 if len(msg) < 5:
                     raise ValueError('Missing MLS commit transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
-                state.dave_session.process_commit(msg[5:])
+                with state.dave_lock:
+                    state.dave_session.process_commit(msg[5:])
             except Exception:
                 _log.exception('Failed to process MLS commit for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)
             else:
+                state._log_dave_ready()
                 # A transport failure must not invalidate an already applied commit.
                 if transition_id != 0:
-                    state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                    with state.dave_lock:
+                        state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS commit processed for transition id %d', transition_id)
         elif op == self.MLS_WELCOME:
@@ -1198,14 +1204,17 @@ class DiscordVoiceWebSocket:
                 if len(msg) < 5:
                     raise ValueError('Missing MLS welcome transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
-                state.dave_session.process_welcome(msg[5:])
+                with state.dave_lock:
+                    state.dave_session.process_welcome(msg[5:])
             except Exception:
                 _log.exception('Failed to process MLS welcome for transition id %d', transition_id)
                 await state._recover_from_invalid_commit(transition_id)
             else:
+                state._log_dave_ready()
                 # A transport failure must not invalidate an already applied welcome.
                 if transition_id != 0:
-                    state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                    with state.dave_lock:
+                        state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS welcome processed for transition id %d', transition_id)
 
@@ -1221,10 +1230,11 @@ class DiscordVoiceWebSocket:
         # rejecting every user.
         channel = state.voice_client.channel
         voice_states = getattr(channel, 'voice_states', None)
-        state.dave_known_user_ids.clear()
-        if voice_states:
-            state.dave_known_user_ids.update(user_id for user_id in voice_states if user_id != state.user.id)
-            _log.debug('Seeded DAVE membership with %d user(s)', len(state.dave_known_user_ids))
+        with state.dave_lock:
+            state.dave_known_user_ids.clear()
+            if voice_states:
+                state.dave_known_user_ids.update(user_id for user_id in voice_states if user_id != state.user.id)
+                _log.debug('Seeded DAVE membership with %d user(s)', len(state.dave_known_user_ids))
 
         _log.debug('Connecting to voice socket')
         await self.loop.sock_connect(state.socket, (state.endpoint_ip, state.voice_port))
