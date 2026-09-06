@@ -531,6 +531,41 @@ async def test_binary_transition_acknowledgement(binary_harness, op, method, tra
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('op, method', [(29, 'process_commit'), (30, 'process_welcome')])
+async def test_binary_transition_ack_failure_preserves_session(binary_harness, op, method, caplog):
+    harness, session = binary_harness
+    state, ws, sent_json, sent_binary, vc = harness
+    observed = []
+
+    async def fail_ack(transition_id):
+        raise ConnectionError('ack transport failure')
+
+    async def hook(ws, opcode, seq, payload):
+        observed.append((opcode, seq))
+
+    ws.send_transition_ready = fail_ack
+    ws._binary_hook = hook
+    await ws.received_binary_message(binary_frame(3, op, struct.pack('>H', 7) + b'body'))
+
+    getattr(session, method).assert_called_once_with(b'body')
+    assert state.dave_pending_transitions == {7: 1}
+    assert session.reinit_calls == []
+    assert session.reset_calls == 0
+    assert sent_json == []
+    assert sent_binary == []
+    assert observed == [(op, 3)]
+    assert vc.dave_events == [('state', f'binary_op_{op}')]
+    assert 'ack transport failure' in caplog.text
+
+    # The server may have received the ack before the transport reported failure.
+    # Its execute frame must still apply to the session that accepted the commit.
+    await ws.received_message(frame(ws.DAVE_EXECUTE_TRANSITION, {'transition_id': 7}))
+    assert state.dave_pending_transitions == {}
+    assert state.dave_protocol_version == 1
+    assert session.reinit_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('op, method', [(29, 'process_commit'), (30, 'process_welcome')])
 @pytest.mark.parametrize('payload, transition_id', [(b'', 0), (b'\x01', 0), (b'\x00\x07bad', 7)])
 async def test_invalid_binary_transition_recovers(binary_harness, op, method, payload, transition_id):
     harness, session = binary_harness

@@ -1183,13 +1183,15 @@ class DiscordVoiceWebSocket:
                     raise ValueError('Missing MLS commit transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
                 state.dave_session.process_commit(msg[5:])
+            except Exception:
+                _log.exception('Failed to process MLS commit for transition id %d', transition_id)
+                await state._recover_from_invalid_commit(transition_id)
+            else:
+                # A transport failure must not invalidate an already applied commit.
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS commit processed for transition id %d', transition_id)
-            except Exception:
-                _log.exception('Failed to process MLS commit for transition id %d', transition_id)
-                await state._recover_from_invalid_commit(transition_id)
         elif op == self.MLS_WELCOME:
             transition_id = 0
             try:
@@ -1197,13 +1199,15 @@ class DiscordVoiceWebSocket:
                     raise ValueError('Missing MLS welcome transition ID')
                 transition_id = struct.unpack_from('>H', msg, 3)[0]
                 state.dave_session.process_welcome(msg[5:])
+            except Exception:
+                _log.exception('Failed to process MLS welcome for transition id %d', transition_id)
+                await state._recover_from_invalid_commit(transition_id)
+            else:
+                # A transport failure must not invalidate an already applied welcome.
                 if transition_id != 0:
                     state.dave_pending_transitions[transition_id] = state.dave_protocol_version
                     await self.send_transition_ready(transition_id)
                 _log.debug('MLS welcome processed for transition id %d', transition_id)
-            except Exception:
-                _log.exception('Failed to process MLS welcome for transition id %d', transition_id)
-                await state._recover_from_invalid_commit(transition_id)
 
     async def initial_connection(self, data: Dict[str, Any]) -> None:
         state = self._connection
