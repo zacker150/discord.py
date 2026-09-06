@@ -226,6 +226,9 @@ class VoiceConnectionState:
         self.ws: DiscordVoiceWebSocket = MISSING
         # Shared with the player and receive extension. Never hold across an await.
         self.dave_lock = threading.RLock()
+        # Changes on group reset/reinitialization, including in-place native reinit.
+        # Readers compare this under dave_lock before retrying ciphertext.
+        self.dave_session_generation: int = 0
         self.dave_session: Optional[davey.DaveSession] = None
         self.dave_protocol_version: int = 0
         self.dave_pending_transitions: Dict[int, int] = {}
@@ -286,6 +289,7 @@ class VoiceConnectionState:
 
     def _reset_dave_state(self) -> None:
         with self.dave_lock:
+            self.dave_session_generation += 1
             try:
                 if self.dave_session is not None:
                     self.dave_session.reset()
@@ -314,6 +318,7 @@ class VoiceConnectionState:
             if ws is MISSING or channel is None:
                 _log.debug('Skipping DAVE reinitialization without a websocket or channel')
                 return
+            self.dave_session_generation += 1
             if self.dave_protocol_version > 0:
                 if not has_dave:
                     raise RuntimeError('davey library needed in order to use E2EE voice')
