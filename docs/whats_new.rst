@@ -11,6 +11,36 @@ Changelog
 This page keeps a detailed human friendly rendering of what's new and changed
 in specific versions.
 
+Fork
+----
+
+The fork requires Python 3.10 or newer and validates CI on Python 3.14.
+Install the ``voice`` extra for DAVE support. Free-threaded Python is not yet
+validated for DAVE and emits a warning at import.
+
+- A1: Add voice opcode constants and a binary websocket hook, including frames
+  received before the DAVE session exists.
+- A2: Handle JSON transitions and epochs without requiring an existing session;
+  track voice membership and isolate lifecycle callback errors.
+- A3: Validate proposal membership, contain binary handler and hook failures,
+  and preserve valid MLS state when a transition acknowledgment cannot be sent.
+- A4: Synchronize native session access with :attr:`VoiceClient.dave_lock`,
+  reset state on full disconnects and fresh connections, preserve resumed
+  sessions, expire upgrade passthrough, and recover from unexpected polling errors.
+- A5: Expose :attr:`VoiceClient.dave_protocol_version`,
+  :attr:`VoiceClient.dave_ready`, :attr:`VoiceClient.dave_epoch`, and
+  :meth:`VoiceClient.get_dave_verification_code`. Drop outgoing frames while
+  DAVE is negotiated but not ready, counting them in ``_dave_frames_dropped``
+  and logging once per readiness gap. Frames are not buffered; consumers should
+  wait for readiness before starting playback. Version 0 retains plaintext audio.
+
+Subclass :class:`VoiceClient` to override ``on_dave_transition_prepared``,
+``on_dave_transition_executed`` and ``on_dave_epoch_prepared``. The
+``_dave_state_changed`` callback runs after binary processing and its hook,
+including failure paths. These callbacks run synchronously on the event loop.
+Extensions accessing a native session from another thread must use the shared
+lock and release it before awaiting or invoking application callbacks.
+
 .. _vp2p7p1:
 
 v2.7.1
