@@ -225,6 +225,7 @@ def harness(monkeypatch):
     state = VoiceConnectionState.__new__(VoiceConnectionState)
     state.voice_client = voice_client  # type: ignore
     state.dave_lock = threading.RLock()
+    state.dave_session_generation = 0
     state.dave_session = None
     state.dave_protocol_version = 0
     state.dave_pending_transitions = {}

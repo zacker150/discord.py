@@ -56,7 +56,9 @@ def test_reset_clears_all_state_even_when_native_reset_fails(harness, raises):
             raise ValueError('reset failed')
 
     session.reset = reset
+    generation = state.dave_session_generation
     state._reset_dave_state()
+    assert state.dave_session_generation == generation + 1
     assert_reset(state)
     assert available_to_worker(state.dave_lock)
 
@@ -97,6 +99,7 @@ async def test_reinit_without_connection_preserves_state(harness, missing):
     assert session.reinit_calls == []
     assert state.dave_session is session
     assert sent_binary == sent_json == []
+    assert state.dave_session_generation == 0
 
 
 @pytest.mark.asyncio
@@ -107,6 +110,7 @@ async def test_reinit_native_calls_locked_but_send_unlocked(harness):
 
     def reinit(*args):
         assert args == (1, 42, 1000)
+        assert state.dave_session_generation == 1
         assert not available_to_worker(state.dave_lock)
 
     def key_package():
@@ -121,6 +125,7 @@ async def test_reinit_native_calls_locked_but_send_unlocked(harness):
     session.get_serialized_key_package = key_package
     ws.send_binary = send
     await state.reinit_dave_session()
+    assert state.dave_session is session
 
 
 @pytest.mark.asyncio
