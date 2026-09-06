@@ -296,18 +296,67 @@ async def test_downgrade_sets_passthrough_then_executes(harness):
 
 
 @pytest.mark.asyncio
-async def test_prepare_transition_id_zero_executes_immediately(harness):
+@pytest.mark.parametrize('protocol_version', [0, 1])
+async def test_prepare_transition_id_zero_executes_immediately(harness, protocol_version):
     state, ws, sent_json, sent_binary, vc = harness
     state.dave_protocol_version = 1
     state.dave_session = ScriptedDaveSession(1, 42, 999)
 
     await ws.received_message(
-        frame(DiscordVoiceWebSocket.DAVE_PREPARE_TRANSITION, {'transition_id': 0, 'protocol_version': 1})
+        frame(DiscordVoiceWebSocket.DAVE_PREPARE_TRANSITION, {'transition_id': 0, 'protocol_version': protocol_version})
     )
 
     # Executed inline, so no transition-ready ack and nothing left pending.
     assert sent_json == []
     assert state.dave_pending_transitions == {}
+    assert state.dave_protocol_version == protocol_version
+    assert vc.dave_events == [('prepared', 0, protocol_version), ('executed', 0, protocol_version)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ('callback_name', 'op', 'data'),
+    [
+        ('on_dave_transition_prepared', 21, {'transition_id': 7, 'protocol_version': 0}),
+        ('on_dave_transition_prepared', 21, {'transition_id': 0, 'protocol_version': 0}),
+        ('on_dave_transition_executed', 21, {'transition_id': 0, 'protocol_version': 0}),
+        ('on_dave_transition_executed', 22, {'transition_id': 7}),
+        ('on_dave_epoch_prepared', 24, {'epoch': 1, 'protocol_version': 1}),
+    ],
+)
+async def test_callback_failure_does_not_disrupt_protocol(harness, caplog, callback_name, op, data):
+    state, ws, sent_json, sent_binary, vc = harness
+    state.dave_protocol_version = 1
+    session = ScriptedDaveSession(1, 42, 999)
+    state.dave_session = session
+    if op == DiscordVoiceWebSocket.DAVE_EXECUTE_TRANSITION:
+        state.dave_pending_transitions[7] = 0
+
+    def boom(*args):
+        raise RuntimeError('application callback failed')
+
+    setattr(vc, callback_name, boom)
+    await ws.received_message(frame(op, data))
+
+    assert 'application callback failed' in caplog.text
+    if op == DiscordVoiceWebSocket.DAVE_PREPARE_EPOCH:
+        assert sent_json == []
+        assert sent_binary == [(DiscordVoiceWebSocket.MLS_KEY_PACKAGE, b'key-package')]
+        assert session.reinit_calls == [(1, 42, 999)]
+    else:
+        assert sent_binary == []
+        assert session.reinit_calls == []
+        assert session.reset_calls == 0
+        if op == DiscordVoiceWebSocket.DAVE_PREPARE_TRANSITION and data['transition_id'] != 0:
+            assert sent_json == [{'op': DiscordVoiceWebSocket.DAVE_TRANSITION_READY, 'd': {'transition_id': 7}}]
+            assert state.dave_pending_transitions == {7: 0}
+        else:
+            assert sent_json == []
+            assert state.dave_pending_transitions == {}
+            assert state.dave_protocol_version == 0
+            assert state.dave_downgraded is True
+            if callback_name == 'on_dave_transition_prepared':
+                assert vc.dave_events == [('executed', 0, 0)]
 
 
 @pytest.mark.asyncio
@@ -354,7 +403,8 @@ async def test_membership_tracking_survives_unexpected_payload(harness):
 
 
 @pytest.mark.asyncio
-async def test_membership_seeded_from_channel_voice_states(harness):
+@pytest.mark.parametrize('next_user_ids', [(12, 42), (42,), (), None])
+async def test_membership_seeded_from_channel_voice_states(harness, next_user_ids):
     state, ws, sent_json, sent_binary, vc = harness
     vc.channel = StubChannel(voice_states={10: object(), 11: object(), 42: object()})
 
@@ -378,3 +428,11 @@ async def test_membership_seeded_from_channel_voice_states(harness):
 
     # Our own id is excluded; the proposal check adds it back.
     assert state.dave_known_user_ids == {10, 11}
+
+    # A fresh READY after a reconnect or channel move replaces the old snapshot,
+    # including when the new channel has an empty or unavailable cache.
+    vc.channel = StubChannel(channel_id=1000, voice_states=dict.fromkeys(next_user_ids or ()))
+    if next_user_ids is None:
+        del vc.channel.voice_states
+    await ws.initial_connection({'ssrc': 2, 'port': 3, 'ip': '1.2.3.4', 'modes': ['aead_xchacha20_poly1305_rtpsize']})
+    assert state.dave_known_user_ids == set(next_user_ids or ()) - {42}

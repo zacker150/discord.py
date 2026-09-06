@@ -1055,6 +1055,13 @@ class DiscordVoiceWebSocket:
         except (KeyError, TypeError, ValueError):
             _log.debug('Could not track DAVE membership from voice op %d: %s', op, data)
 
+    def _call_dave_callback(self, callback: Callable[[int, int], None], identifier: int, protocol_version: int) -> None:
+        # Application callbacks must not interrupt the handshake or trigger re-keying.
+        try:
+            callback(identifier, protocol_version)
+        except Exception:
+            _log.exception('Exception in DAVE lifecycle callback')
+
     async def _handle_dave_json(self, op: int, data: Dict[str, Any]) -> None:
         state = self._connection
         transition_id = data.get('transition_id', 0)
@@ -1079,16 +1086,21 @@ class DiscordVoiceWebSocket:
                     state.dave_protocol_version = protocol_version
                     await state.reinit_dave_session()
 
-                state.voice_client.on_dave_transition_prepared(transition_id, protocol_version)
+                self._call_dave_callback(state.voice_client.on_dave_transition_prepared, transition_id, protocol_version)
 
                 if transition_id == 0:
                     await state._execute_transition(transition_id)
+                    self._call_dave_callback(
+                        state.voice_client.on_dave_transition_executed, transition_id, state.dave_protocol_version
+                    )
                 else:
                     await self.send_transition_ready(transition_id)
             elif op == self.DAVE_EXECUTE_TRANSITION:
                 _log.debug('Executing DAVE transition id %d', transition_id)
                 await state._execute_transition(transition_id)
-                state.voice_client.on_dave_transition_executed(transition_id, state.dave_protocol_version)
+                self._call_dave_callback(
+                    state.voice_client.on_dave_transition_executed, transition_id, state.dave_protocol_version
+                )
             elif op == self.DAVE_PREPARE_EPOCH:
                 epoch = data['epoch']
                 protocol_version = data['protocol_version']
@@ -1098,7 +1110,7 @@ class DiscordVoiceWebSocket:
                 if epoch == 1:
                     state.dave_protocol_version = protocol_version
                     await state.reinit_dave_session()
-                state.voice_client.on_dave_epoch_prepared(epoch, protocol_version)
+                self._call_dave_callback(state.voice_client.on_dave_epoch_prepared, epoch, protocol_version)
         except Exception:
             _log.exception('Failed to handle DAVE voice op %d, re-keying', op)
             try:
@@ -1169,6 +1181,7 @@ class DiscordVoiceWebSocket:
         # rejecting every user.
         channel = state.voice_client.channel
         voice_states = getattr(channel, 'voice_states', None)
+        state.dave_known_user_ids.clear()
         if voice_states:
             state.dave_known_user_ids.update(user_id for user_id in voice_states if user_id != state.user.id)
             _log.debug('Seeded DAVE membership with %d user(s)', len(state.dave_known_user_ids))
